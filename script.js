@@ -32,7 +32,7 @@ async function initLLM() {
   addMessage("Loading local LLM in your browser (WebGPU)...", "system");
   setInputEnabled(false);
 
-  const model = "Llama-3.2-3B-Instruct-q4f16_1";
+  const model = "Llama-3.2-3B-Instruct-q4f32_1";
 
   engine = await webllm.CreateMLCEngine(model, {
     initProgressCallback: (p) => {
