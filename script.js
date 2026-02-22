@@ -9,6 +9,12 @@ const messagesDiv = document.getElementById("messages");
 const inputEl = document.getElementById("user-input");
 const sendBtn = document.getElementById("send-btn");
 
+function updateDebug(info) {
+  const debugEl = document.getElementById("debug-content");
+  debugEl.textContent = JSON.stringify(info, null, 2);
+}
+
+
 function addMessage(text, sender) {
   const msg = document.createElement("div");
   msg.classList.add("message", sender);
@@ -30,18 +36,25 @@ let engineReady = false;
 
 async function initLLM() {
   addMessage("Loading local LLM in your browser (WebGPU)...", "system");
+  updateDebug({ status: "Loading LLM...", webgpu: navigator.gpu ? "Available" : "NOT available" });
   setInputEnabled(false);
 
   const model = "Llama-3.2-3B-Instruct-q4f32_1";
 
   engine = await webllm.CreateMLCEngine(model, {
     initProgressCallback: (p) => {
-      // Optional: show progress
+      updateDebug({ status: "Loading model...", progress: p.progress, text: p.text, webgpu: navigator.gpu ? "Available" : "NOT available" });
     }
   });
 
   engineReady = true;
   addMessage("LLM ready. You can start typing.", "system");
+  updateDebug({
+  status: "LLM Ready",
+  model: model,
+  webgpu: navigator.gpu ? "Available" : "NOT available"
+});
+
   setInputEnabled(true);
 }
 
@@ -194,6 +207,10 @@ async function handleIntent(text) {
   }
 }
 
+await handleIntent(text);
+debugState();
+
+
 async function handleParams(text) {
   const extracted = await extractParams(session.pattern, text);
   session.collected = { ...session.collected, ...extracted };
@@ -208,6 +225,10 @@ async function handleParams(text) {
     await handleSql();
   }
 }
+
+await handleParams(text);
+debugState();
+
 
 async function handleSql() {
   const def = KNOWN_PATTERNS[session.pattern];
@@ -226,6 +247,10 @@ async function handleSql() {
   session.missing = [];
   session.stage = Stage.AwaitingIntent;
 }
+
+await handleSql(text);
+debugState();
+
 
 // ---------------------------
 // Main Handler
@@ -259,3 +284,14 @@ sendBtn.addEventListener("click", handleUserMessage);
 inputEl.addEventListener("keypress", e => {
   if (e.key === "Enter") handleUserMessage();
 });
+
+function debugState() {
+  updateDebug({
+    status: engineReady ? "LLM Ready" : "Loading",
+    stage: session.stage,
+    pattern: session.pattern,
+    collectedParams: session.collected,
+    missingParams: session.missing
+  });
+}
+

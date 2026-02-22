@@ -79,3 +79,34 @@ body {
 #send-btn:disabled {
   background: #9bbfe5;
 }
+
+#debug-panel {
+  position: fixed;
+  bottom: 0;
+  right: 0;
+  width: 320px;
+  height: 260px;
+  background: #1e1e1e;
+  color: #dcdcdc;
+  font-size: 12px;
+  border-top-left-radius: 8px;
+  box-shadow: 0 0 10px rgba(0,0,0,0.4);
+  display: flex;
+  flex-direction: column;
+  z-index: 9999;
+}
+
+#debug-header {
+  padding: 6px 10px;
+  background: #333;
+  font-weight: bold;
+  border-top-left-radius: 8px;
+}
+
+#debug-content {
+  flex: 1;
+  padding: 10px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
