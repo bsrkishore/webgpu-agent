@@ -41,7 +41,7 @@ async function initLLM() {
 
  const model = "Llama-3.2-3B-Instruct-q4f32_1";
 
-const appConfig = await webllm.prebuiltAppConfig;
+const appConfig = await webllm.prebuiltAppConfigFromCDN();
 
 engine = await webllm.CreateMLCEngine(model, {
   appConfig,
