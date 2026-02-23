@@ -39,10 +39,12 @@ async function initLLM() {
   updateDebug({ status: "Loading LLM...", webgpu: navigator.gpu ? "Available" : "NOT available" });
   setInputEnabled(false);
 
-  const model = "Llama-3.2-3B-Instruct-q4f32_1";
+ const model = "Llama-3.2-3B-Instruct-q4f32_1";
+
+const appConfig = await webllm.prebuiltAppConfig;
 
 engine = await webllm.CreateMLCEngine(model, {
-  model_list: await webllm.prebuiltAppConfig.model_list,
+  appConfig,
   initProgressCallback: (p) => {
     updateDebug({
       status: "Loading model...",
@@ -51,6 +53,11 @@ engine = await webllm.CreateMLCEngine(model, {
       webgpu: navigator.gpu ? "Available" : "NOT available"
     });
   }
+});
+
+updateDebug({
+  status: "Loaded appConfig",
+  modelsAvailable: appConfig.model_list.map(m => m.model_id)
 });
 
 
