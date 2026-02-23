@@ -41,11 +41,18 @@ async function initLLM() {
 
   const model = "Llama-3.2-3B-Instruct-q4f32_1";
 
-  engine = await webllm.CreateMLCEngine(model, {
-    initProgressCallback: (p) => {
-      updateDebug({ status: "Loading model...", progress: p.progress, text: p.text, webgpu: navigator.gpu ? "Available" : "NOT available" });
-    }
-  });
+engine = await webllm.CreateMLCEngine(model, {
+  model_list: await webllm.prebuiltAppConfig.model_list,
+  initProgressCallback: (p) => {
+    updateDebug({
+      status: "Loading model...",
+      progress: p.progress,
+      text: p.text,
+      webgpu: navigator.gpu ? "Available" : "NOT available"
+    });
+  }
+});
+
 
   engineReady = true;
   addMessage("LLM ready. You can start typing.", "system");
