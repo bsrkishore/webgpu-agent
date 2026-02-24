@@ -1,26 +1,34 @@
-// script.js (type="module")
-
-import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+// ---------------------------
+// CONFIG
+// ---------------------------
+const OLLAMA_BASE_URL = "https://lacier-costless-elisabeth.ngrok-free.dev"; // e.g. "https://a1b2c3d4.ngrok-free.app"
 
 // ---------------------------
-// UI Elements
+// UI ELEMENTS
 // ---------------------------
 const messagesDiv = document.getElementById("messages");
 const inputEl = document.getElementById("user-input");
 const sendBtn = document.getElementById("send-btn");
+const modelSelect = document.getElementById("model-select");
+const debugEl = document.getElementById("debug-content");
 
+// ---------------------------
+// DEBUG
+// ---------------------------
 function updateDebug(info) {
-  const debugEl = document.getElementById("debug-content");
   debugEl.textContent = JSON.stringify(info, null, 2);
 }
 
-
+// ---------------------------
+// MESSAGES
+// ---------------------------
 function addMessage(text, sender) {
   const msg = document.createElement("div");
   msg.classList.add("message", sender);
   msg.textContent = text;
   messagesDiv.appendChild(msg);
   msg.scrollIntoView({ behavior: "smooth" });
+  return msg;
 }
 
 function setInputEnabled(enabled) {
@@ -29,79 +37,7 @@ function setInputEnabled(enabled) {
 }
 
 // ---------------------------
-// WebLLM Initialization
-// ---------------------------
-let engine = null;
-let engineReady = false;
-
-async function initLLM() {
-  addMessage("Loading local LLM in your browser (WebGPU)...", "system");
-  updateDebug({ status: "Loading LLM...", webgpu: navigator.gpu ? "Available" : "NOT available" });
-  setInputEnabled(false);
-
- const model = "Llama-3.2-3B-Instruct-q4f32_1";
-
-const appConfig = await webllm.prebuiltAppConfigFromCDN();
-
-engine = await webllm.CreateMLCEngine(model, {
-  appConfig,
-  initProgressCallback: (p) => {
-    updateDebug({
-      status: "Loading model...",
-      progress: p.progress,
-      text: p.text,
-      webgpu: navigator.gpu ? "Available" : "NOT available"
-    });
-  }
-});
-
-updateDebug({
-  status: "Loaded appConfig",
-  modelsAvailable: appConfig.model_list.map(m => m.model_id)
-});
-
-
-  engineReady = true;
-  addMessage("LLM ready. You can start typing.", "system");
-  updateDebug({
-  status: "LLM Ready",
-  model: model,
-  webgpu: navigator.gpu ? "Available" : "NOT available"
-});
-
-  setInputEnabled(true);
-}
-
-initLLM();
-
-// ---------------------------
-// LLM Wrapper
-// ---------------------------
-async function callLLM(prompt) {
-  const res = await engine.chat.completions.create({
-    messages: [
-      { role: "system", content: "You are a precise assistant for production support workflows." },
-      { role: "user", content: prompt }
-    ],
-    temperature: 0.1,
-    max_tokens: 256
-  });
-
-  return res.choices[0].message.content.trim();
-}
-
-// ---------------------------
-// Patterns
-// ---------------------------
-const KNOWN_PATTERNS = {
-  UpdateEmailForPolicy: {
-    requiredParams: ["PolicyNumber", "NewEmail"],
-    sqlTemplate: "UPDATE PolicyHolder SET Email = @NewEmail WHERE PolicyNumber = @PolicyNumber;"
-  }
-};
-
-// ---------------------------
-// Session State
+// SESSION / STATE MACHINE
 // ---------------------------
 const Stage = {
   AwaitingIntent: "AwaitingIntent",
@@ -109,15 +45,91 @@ const Stage = {
   ReadyToGenerateSql: "ReadyToGenerateSql"
 };
 
-const session = {
-  pattern: null,
-  collected: {},
-  missing: [],
-  stage: Stage.AwaitingIntent
+const KNOWN_PATTERNS = {
+  UpdateEmailForPolicy: {
+    requiredParams: ["PolicyNumber", "NewEmail"],
+    sqlTemplate: "UPDATE PolicyHolder SET Email = @NewEmail WHERE PolicyNumber = @PolicyNumber;"
+  }
 };
 
+const session = {
+  stage: Stage.AwaitingIntent,
+  pattern: null,
+  collected: {},
+  missing: []
+};
+
+function debugState(extra = {}) {
+  updateDebug({
+    status: "OK",
+    stage: session.stage,
+    pattern: session.pattern,
+    collectedParams: session.collected,
+    missingParams: session.missing,
+    model: modelSelect.value,
+    ...extra
+  });
+}
+
 // ---------------------------
-// Intent Classification
+// OLLAMA STREAMING CALL
+// ---------------------------
+async function callLLMStreaming(prompt) {
+  const model = modelSelect.value;
+
+  const response = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: true,
+      messages: [
+        { role: "system", content: "You are a precise assistant for production support workflows." },
+        { role: "user", content: prompt }
+      ]
+    })
+  });
+
+  if (!response.ok || !response.body) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`LLM HTTP error ${response.status}: ${text}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let fullText = "";
+
+  const agentMsg = addMessage("", "agent");
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    const lines = chunk.split("\n").filter(l => l.trim().startsWith("data:"));
+
+    for (const line of lines) {
+      const jsonStr = line.replace(/^data:\s*/, "");
+      if (jsonStr === "[DONE]") continue;
+
+      try {
+        const data = JSON.parse(jsonStr);
+        const delta = data.choices?.[0]?.delta?.content || "";
+        if (delta) {
+          fullText += delta;
+          agentMsg.textContent = fullText;
+        }
+      } catch {
+        // ignore parse errors on partial chunks
+      }
+    }
+  }
+
+  return fullText.trim();
+}
+
+// ---------------------------
+// INTENT CLASSIFICATION
 // ---------------------------
 async function classifyIntent(text) {
   const prompt = `
@@ -128,13 +140,14 @@ Match the user request to one pattern:
 User: "${text}"
 
 Respond ONLY with the pattern name or "Unknown".
-  `.trim();
+`.trim();
 
-  return (await callLLM(prompt)).split(/\s+/)[0];
+  const out = await callLLMStreaming(prompt);
+  return out.split(/\s+/)[0];
 }
 
 // ---------------------------
-// Parameter Extraction
+// PARAMETER EXTRACTION
 // ---------------------------
 async function extractParams(pattern, text) {
   const prompt = `
@@ -145,19 +158,22 @@ Required: PolicyNumber, NewEmail
 User: "${text}"
 
 Return JSON only.
-  `.trim();
+`.trim();
+
+  const out = await callLLMStreaming(prompt);
 
   try {
-    const out = await callLLM(prompt);
-    const json = out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1);
-    return JSON.parse(json);
+    const start = out.indexOf("{");
+    const end = out.lastIndexOf("}");
+    if (start === -1 || end === -1) return {};
+    return JSON.parse(out.slice(start, end + 1));
   } catch {
     return {};
   }
 }
 
 // ---------------------------
-// SQL Template Filling
+// SQL TEMPLATE FILLING
 // ---------------------------
 async function fillTemplate(template, params) {
   const prompt = `
@@ -169,13 +185,13 @@ Parameters:
 ${JSON.stringify(params)}
 
 Return ONLY the SQL.
-  `.trim();
+`.trim();
 
-  return await callLLM(prompt);
+  return await callLLMStreaming(prompt);
 }
 
 // ---------------------------
-// SQL Validation
+// SQL VALIDATION
 // ---------------------------
 function validateSql(sql) {
   const s = sql.toUpperCase();
@@ -183,24 +199,28 @@ function validateSql(sql) {
   if (!s.startsWith("UPDATE")) return "Only UPDATE allowed.";
   if (!s.includes("WHERE")) return "WHERE clause required.";
 
-  const forbidden = ["DELETE", "DROP", "ALTER", "INSERT", "TRUNCATE", "UNION", "--", "/*"];
+  const forbidden = ["DELETE", "DROP", "ALTER", "INSERT", "TRUNCATE", "UNION", "--", "/*", "*/", "EXEC"];
   for (const f of forbidden) if (s.includes(f)) return `Forbidden keyword: ${f}`;
 
   if (!s.includes("POLICYHOLDER")) return "Only PolicyHolder table allowed.";
   if (!s.includes("EMAIL") || !s.includes("POLICYNUMBER"))
     return "Only Email and PolicyNumber columns allowed.";
 
+  if (s.includes(" LIKE ") || s.includes(" IN ") || s.includes(" BETWEEN "))
+    return "Pattern does not allow multi-row updates.";
+
   return null;
 }
 
 // ---------------------------
-// State Machine Handlers
+// STATE HANDLERS
 // ---------------------------
 async function handleIntent(text) {
   const pattern = await classifyIntent(text);
 
   if (pattern === "Unknown") {
     addMessage("I only support updating email for a policy in this POC.", "agent");
+    debugState({ note: "Unknown pattern" });
     return;
   }
 
@@ -209,7 +229,6 @@ async function handleIntent(text) {
 
   const extracted = await extractParams(pattern, text);
   session.collected = extracted;
-
   session.missing = def.requiredParams.filter(p => !session.collected[p]);
 
   if (session.missing.length > 0) {
@@ -219,11 +238,9 @@ async function handleIntent(text) {
     session.stage = Stage.ReadyToGenerateSql;
     await handleSql();
   }
+
+  debugState();
 }
-
-await handleIntent(text);
-debugState();
-
 
 async function handleParams(text) {
   const extracted = await extractParams(session.pattern, text);
@@ -238,11 +255,9 @@ async function handleParams(text) {
     session.stage = Stage.ReadyToGenerateSql;
     await handleSql();
   }
+
+  debugState();
 }
-
-await handleParams(text);
-debugState();
-
 
 async function handleSql() {
   const def = KNOWN_PATTERNS[session.pattern];
@@ -252,22 +267,19 @@ async function handleSql() {
   if (error) {
     addMessage("SQL failed validation:\n" + error + "\n\nGenerated:\n" + sql, "agent");
   } else {
-    addMessage("Here is your SQL:\n\n" + sql, "agent");
+    addMessage("Here is your SQL:\n\n" + sql + "\n\n(POC only – do not run directly in prod.)", "agent");
   }
 
-  // Reset
+  session.stage = Stage.AwaitingIntent;
   session.pattern = null;
   session.collected = {};
   session.missing = [];
-  session.stage = Stage.AwaitingIntent;
+
+  debugState({ note: "Session reset after SQL" });
 }
 
-await handleSql(text);
-debugState();
-
-
 // ---------------------------
-// Main Handler
+// MAIN HANDLER
 // ---------------------------
 async function handleUserMessage() {
   const text = inputEl.value.trim();
@@ -276,36 +288,47 @@ async function handleUserMessage() {
   inputEl.value = "";
   addMessage(text, "user");
 
-  if (!engineReady) {
-    addMessage("Model still loading...", "agent");
-    return;
-  }
-
   setInputEnabled(false);
-
   try {
     if (session.stage === Stage.AwaitingIntent) {
       await handleIntent(text);
     } else if (session.stage === Stage.AwaitingParams) {
       await handleParams(text);
     }
+  } catch (err) {
+    addMessage("Error: " + err.message, "agent");
+    debugState({ error: err.message });
   } finally {
     setInputEnabled(true);
   }
 }
 
+// ---------------------------
+// CONNECTION TEST
+// ---------------------------
+async function testConnection() {
+  try {
+    const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+    const data = await res.json();
+    updateDebug({
+      status: "Connected to local LLM",
+      models: data.models?.map(m => m.name)
+    });
+  } catch (err) {
+    updateDebug({
+      status: "Cannot reach local LLM",
+      error: err.message,
+      hint: "Check ngrok is running and URL is correct."
+    });
+  }
+}
+
+testConnection();
+
+// ---------------------------
+// EVENTS
+// ---------------------------
 sendBtn.addEventListener("click", handleUserMessage);
 inputEl.addEventListener("keypress", e => {
   if (e.key === "Enter") handleUserMessage();
 });
-
-function debugState() {
-  updateDebug({
-    status: engineReady ? "LLM Ready" : "Loading",
-    stage: session.stage,
-    pattern: session.pattern,
-    collectedParams: session.collected,
-    missingParams: session.missing
-  });
-}
-

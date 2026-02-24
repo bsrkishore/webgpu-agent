@@ -1,5 +1,5 @@
 body {
-  font-family: system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #f5f5f5;
   margin: 0;
 }
@@ -17,10 +17,18 @@ body {
 }
 
 #header {
-  padding: 12px 16px;
+  padding: 10px 16px;
   border-bottom: 1px solid #e0e0e0;
   font-weight: 600;
   background: #fafafa;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+#model-select {
+  font-size: 13px;
+  padding: 4px 6px;
 }
 
 #messages {
@@ -34,6 +42,8 @@ body {
   padding: 10px 14px;
   border-radius: 6px;
   max-width: 80%;
+  font-size: 14px;
+  line-height: 1.4;
   white-space: pre-wrap;
 }
 
@@ -64,6 +74,7 @@ body {
   padding: 10px;
   border-radius: 6px;
   border: 1px solid #ccc;
+  font-size: 14px;
 }
 
 #send-btn {
@@ -74,17 +85,20 @@ body {
   color: white;
   border-radius: 6px;
   cursor: pointer;
+  font-size: 14px;
 }
 
 #send-btn:disabled {
   background: #9bbfe5;
+  cursor: default;
 }
 
+/* Debug panel */
 #debug-panel {
   position: fixed;
   bottom: 0;
   right: 0;
-  width: 320px;
+  width: 340px;
   height: 260px;
   background: #1e1e1e;
   color: #dcdcdc;
@@ -109,4 +123,3 @@ body {
   overflow-y: auto;
   white-space: pre-wrap;
 }
-
