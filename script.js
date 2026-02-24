@@ -323,7 +323,7 @@ async function testConnection() {
   }
 }
 
-testConnection();
+//testConnection();
 
 // ---------------------------
 // EVENTS
