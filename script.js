@@ -77,7 +77,7 @@ function debugState(extra = {}) {
 async function callLLMStreaming(prompt) {
   const model = modelSelect.value;
 
-  const response = await fetch(`${OLLAMA_BASE_URL}/v1/chat/completions`, {
+  const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
