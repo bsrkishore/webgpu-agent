@@ -109,20 +109,24 @@ async function callLLMStreaming(prompt) {
     const lines = chunk.split("\n").filter(l => l.trim().startsWith("data:"));
 
     for (const line of lines) {
-      const jsonStr = line.replace(/^data:\s*/, "");
-      if (jsonStr === "[DONE]") continue;
+  const jsonStr = line.replace(/^data:\s*/, "");
+  if (jsonStr === "[DONE]") continue;
 
-      try {
-        const data = JSON.parse(jsonStr);
-        const delta = data.choices?.[0]?.delta?.content || "";
-        if (delta) {
-          fullText += delta;
-          agentMsg.textContent = fullText;
-        }
-      } catch {
-        // ignore parse errors on partial chunks
-      }
+  try {
+    const data = JSON.parse(jsonStr);
+
+    // OLLAMA FORMAT
+    const delta = data.message?.content || "";
+
+    if (delta) {
+      fullText += delta;
+      agentMsg.textContent = fullText;
     }
+  } catch {
+    // ignore partial chunks
+  }
+}
+
   }
 
   return fullText.trim();
