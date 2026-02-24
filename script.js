@@ -72,7 +72,7 @@ function debugState(extra = {}) {
 }
 
 // ---------------------------
-// OLLAMA STREAMING CALL
+// OLLAMA STREAMING CALL (NDJSON format)
 // ---------------------------
 async function callLLMStreaming(prompt) {
   const model = modelSelect.value;
@@ -106,27 +106,31 @@ async function callLLMStreaming(prompt) {
     if (done) break;
 
     const chunk = decoder.decode(value, { stream: true });
-    const lines = chunk.split("\n").filter(l => l.trim().startsWith("data:"));
+
+    // Ollama streams NDJSON lines, no "data:" prefix
+    const lines = chunk.split("\n").filter(l => l.trim() !== "");
 
     for (const line of lines) {
-  const jsonStr = line.replace(/^data:\s*/, "");
-  if (jsonStr === "[DONE]") continue;
+      const jsonStr = line.trim();
+      if (!jsonStr) continue;
 
-  try {
-    const data = JSON.parse(jsonStr);
+      try {
+        const data = JSON.parse(jsonStr);
 
-    // OLLAMA FORMAT
-    const delta = data.message?.content || "";
+        // Ollama format: { message: { role, content }, done?: boolean }
+        if (data.done) {
+          continue;
+        }
 
-    if (delta) {
-      fullText += delta;
-      agentMsg.textContent = fullText;
+        const delta = data.message?.content || "";
+        if (delta) {
+          fullText += delta;
+          agentMsg.textContent = fullText;
+        }
+      } catch {
+        // ignore parse errors on partial chunks
+      }
     }
-  } catch {
-    // ignore partial chunks
-  }
-}
-
   }
 
   return fullText.trim();
@@ -147,7 +151,8 @@ Respond ONLY with the pattern name or "Unknown".
 `.trim();
 
   const out = await callLLMStreaming(prompt);
-  return out.split(/\s+/)[0];
+  const token = out.split(/\s+/)[0] || "";
+  return token.replace(/[^A-Za-z0-9_]/g, "");
 }
 
 // ---------------------------
@@ -222,14 +227,21 @@ function validateSql(sql) {
 async function handleIntent(text) {
   const pattern = await classifyIntent(text);
 
-  if (pattern === "Unknown") {
+  if (!pattern || pattern === "Unknown") {
     addMessage("I only support updating email for a policy in this POC.", "agent");
-    debugState({ note: "Unknown pattern" });
+    debugState({ note: "Unknown or empty pattern", rawPattern: pattern });
     return;
   }
 
   session.pattern = pattern;
   const def = KNOWN_PATTERNS[pattern];
+
+  if (!def) {
+    addMessage(`Pattern "${pattern}" is not configured in this POC.`, "agent");
+    debugState({ note: "Pattern not found in KNOWN_PATTERNS", rawPattern: pattern });
+    session.pattern = null;
+    return;
+  }
 
   const extracted = await extractParams(pattern, text);
   session.collected = extracted;
@@ -247,10 +259,21 @@ async function handleIntent(text) {
 }
 
 async function handleParams(text) {
+  const def = KNOWN_PATTERNS[session.pattern];
+
+  if (!def) {
+    addMessage("Internal state error: pattern definition missing. Resetting session.", "agent");
+    session.stage = Stage.AwaitingIntent;
+    session.pattern = null;
+    session.collected = {};
+    session.missing = [];
+    debugState({ error: "Missing pattern definition in handleParams" });
+    return;
+  }
+
   const extracted = await extractParams(session.pattern, text);
   session.collected = { ...session.collected, ...extracted };
 
-  const def = KNOWN_PATTERNS[session.pattern];
   session.missing = def.requiredParams.filter(p => !session.collected[p]);
 
   if (session.missing.length > 0) {
@@ -265,6 +288,17 @@ async function handleParams(text) {
 
 async function handleSql() {
   const def = KNOWN_PATTERNS[session.pattern];
+
+  if (!def) {
+    addMessage("Internal state error: pattern definition missing during SQL generation. Resetting session.", "agent");
+    session.stage = Stage.AwaitingIntent;
+    session.pattern = null;
+    session.collected = {};
+    session.missing = [];
+    debugState({ error: "Missing pattern definition in handleSql" });
+    return;
+  }
+
   const sql = await fillTemplate(def.sqlTemplate, session.collected);
 
   const error = validateSql(sql);
@@ -301,18 +335,23 @@ async function handleUserMessage() {
     }
   } catch (err) {
     addMessage("Error: " + err.message, "agent");
-    debugState({ error: err.message });
+    debugState({ error: err.message, stack: err.stack });
   } finally {
     setInputEnabled(true);
   }
 }
 
 // ---------------------------
-// CONNECTION TEST
+// CONNECTION TEST (safe version)
 // ---------------------------
 async function testConnection() {
   try {
-    const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+    // Ollama accepts POST to /api/tags; this plays nicer with some ngrok setups
+    const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
     const data = await res.json();
     updateDebug({
       status: "Connected to local LLM",
@@ -327,7 +366,8 @@ async function testConnection() {
   }
 }
 
-//testConnection();
+// Uncomment if you want the connection test to run on load
+// testConnection();
 
 // ---------------------------
 // EVENTS
