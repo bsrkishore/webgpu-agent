@@ -134,7 +134,7 @@ async function callLLMStreaming(prompt) {
 }
 
 // ---------------------------
-// HYBRID FIELD DETECTION (F3)
+// HYBRID FIELD DETECTION (F3 + C1)
 // ---------------------------
 async function detectField(text) {
   const t = text.toLowerCase();
@@ -156,7 +156,7 @@ Email, Phone, Address, PolicyNumber, Unknown.
 `.trim();
 
   const out = await callLLMStreaming(prompt);
-  const field = out.split(/\s+/)[0];
+  const field = (out.split(/\s+/)[0] || "").trim();
 
   const canonical = ["Email", "Phone", "Address", "PolicyNumber", "Unknown"];
   return canonical.includes(field) ? field : "Unknown";
@@ -177,7 +177,7 @@ Respond ONLY with the pattern name or "Unknown".
 `.trim();
 
   const out = await callLLMStreaming(prompt);
-  return out.split(/\s+/)[0] || "Unknown";
+  return (out.split(/\s+/)[0] || "Unknown").trim();
 }
 
 // ---------------------------
@@ -250,18 +250,28 @@ function detectConversationMode(text) {
   if (SMALL_TALK.some(p => t.includes(p))) return "smallTalk";
 
   const DOMAIN = ["policy", "email", "account"];
-  const PROBLEM = ["wrong", "incorrect", "issue", "problem", "mismatch"];
+  const PROBLEM = ["wrong", "incorrect", "issue", "problem", "mismatch", "not right"];
   const ACTION = ["update", "change", "fix", "correct", "modify"];
 
   const hasDomain = DOMAIN.some(k => t.includes(k));
   const hasProblem = PROBLEM.some(k => t.includes(k));
   const hasAction = ACTION.some(k => t.includes(k));
 
+  // If user mentions policy but no number → generic problem
+  const hasPolicy = t.includes("policy");
+  const hasNumber = /\d/.test(t);
+
   if (hasAction) return "action";
   if (hasDomain && hasProblem) return "domainProblem";
+  if (hasPolicy && !hasNumber) return "genericProblem";
   if (hasDomain) return "genericProblem";
 
   return "unknown";
+}
+
+function isCapabilityQuestion(text) {
+  const t = text.toLowerCase();
+  return t.includes("what can you do") || t.includes("how can you help");
 }
 
 // ---------------------------
@@ -271,7 +281,8 @@ async function handleIntent(text) {
   const pattern = await classifyIntent(text);
 
   if (pattern === "Unknown") {
-    addMessage("I only support updating email for a policy in this POC.", "agent");
+    addMessage("I only support updating the email for a policy in this POC.", "agent");
+    debugState({ note: "Unknown pattern from classifyIntent", raw: text });
     return;
   }
 
@@ -289,6 +300,8 @@ async function handleIntent(text) {
     session.stage = Stage.ReadyToGenerateSql;
     await handleSql();
   }
+
+  debugState();
 }
 
 async function handleParams(text) {
@@ -304,6 +317,8 @@ async function handleParams(text) {
     session.stage = Stage.ReadyToGenerateSql;
     await handleSql();
   }
+
+  debugState();
 }
 
 async function handleSql() {
@@ -314,13 +329,17 @@ async function handleSql() {
   if (error) {
     addMessage("SQL failed validation:\n" + error + "\n\nGenerated:\n" + sql, "agent");
   } else {
-    addMessage("Here is your SQL:\n\n" + sql, "agent");
+    addMessage("Here is your SQL:\n\n" + sql + "\n\n(POC only – do not run directly in prod.)", "agent");
   }
 
   session.stage = Stage.Conversation;
   session.pattern = null;
   session.collected = {};
   session.missing = [];
+  session.pendingField = null;
+  session.pendingAction = null;
+
+  debugState({ note: "Session reset after SQL" });
 }
 
 // ---------------------------
@@ -336,67 +355,114 @@ async function handleUserMessage() {
   setInputEnabled(false);
 
   try {
-    const mode = detectConversationMode(text);
-
-    // Small talk
-    if (mode === "smallTalk") {
-      addMessage("Hi! What can I help you with today?", "agent");
+    // Capability questions
+    if (isCapabilityQuestion(text)) {
+      addMessage(
+        "Right now I can help with updating the email address for a policy and generating safe SQL for it.",
+        "agent"
+      );
+      debugState({ note: "Capability question detected" });
       return;
     }
 
-    // Domain problem → ask yes/no confirmation
-    if (mode === "domainProblem") {
-      session.stage = Stage.AwaitingYesNo;
-      session.pendingField = await detectField(text);
-      addMessage(`It sounds like the ${session.pendingField.toLowerCase()} on the policy is incorrect. Do you want to update it?`, "agent");
-      return;
-    }
-
-    // Awaiting yes/no
+    // If we're in yes/no confirmation stage
     if (session.stage === Stage.AwaitingYesNo) {
       const t = text.toLowerCase();
+
       if (t === "yes" || t === "y") {
+        // Option A: proceed with UpdateEmailForPolicy
         session.pattern = "UpdateEmailForPolicy";
         session.stage = Stage.AwaitingParams;
         addMessage("Sure — what's the policy number?", "agent");
+        debugState({ note: "User confirmed yes to update" });
         return;
       }
+
       if (t === "no" || t === "n") {
+        // Option N3: generic fallback
         session.stage = Stage.Conversation;
+        session.pendingField = null;
         addMessage("No problem — what is wrong with the policy?", "agent");
+        debugState({ note: "User declined update" });
         return;
       }
+
+      // If they accidentally give useful info (policy number or email), treat as params
+      if (/\d/.test(text) || text.includes("@")) {
+        session.pattern = "UpdateEmailForPolicy";
+        session.stage = Stage.AwaitingParams;
+        await handleParams(text);
+        return;
+      }
+
       addMessage("Please answer yes or no.", "agent");
       return;
     }
 
-    // Generic problem
-    if (mode === "genericProblem") {
-      addMessage("What is wrong with the policy?", "agent");
-      return;
-    }
-
-    // Actionable request → run intent
-    if (mode === "action") {
-      await handleIntent(text);
-      return;
-    }
-
-    // If already collecting params
+    // If we're already collecting params
     if (session.stage === Stage.AwaitingParams) {
       await handleParams(text);
       return;
     }
 
+    // Conversation mode
+    const mode = detectConversationMode(text);
+
+    if (mode === "smallTalk") {
+      addMessage("Hi! What can I help you with today?", "agent");
+      debugState({ note: "Small talk" });
+      return;
+    }
+
+    if (mode === "genericProblem") {
+      addMessage("What is wrong with the policy?", "agent");
+      debugState({ note: "Generic problem detected" });
+      return;
+    }
+
+    if (mode === "domainProblem") {
+      // Try to detect field
+      const field = await detectField(text);
+      session.pendingField = field;
+
+      if (field === "Unknown") {
+        // Fallback to generic clarification
+        session.stage = Stage.Conversation;
+        addMessage("I can help with policy updates. What is wrong with the policy?", "agent");
+        debugState({ note: "Domain problem but field unknown" });
+        return;
+      }
+
+      // Ask yes/no confirmation (Option A)
+      session.stage = Stage.AwaitingYesNo;
+      addMessage(
+        `It sounds like the ${field.toLowerCase()} on the policy is incorrect. Do you want to update it?`,
+        "agent"
+      );
+      debugState({ note: "Domain problem with field", field });
+      return;
+    }
+
+    if (mode === "action") {
+      await handleIntent(text);
+      return;
+    }
+
+    // Fallback for unknown
     addMessage("Can you tell me more about the issue with the policy?", "agent");
+    debugState({ note: "Unknown conversation mode", text });
 
   } catch (err) {
     addMessage("Error: " + err.message, "agent");
-    debugState({ error: err.message });
+    debugState({ error: err.message, stack: err.stack });
   } finally {
     setInputEnabled(true);
   }
 }
+
+// ---------------------------
+// EVENTS
+// ---------------------------
 sendBtn.addEventListener("click", handleUserMessage);
 inputEl.addEventListener("keypress", e => {
   if (e.key === "Enter") handleUserMessage();
