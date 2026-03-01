@@ -1,7 +1,7 @@
 // ---------------------------
 // CONFIG
 // ---------------------------
-const OLLAMA_BASE_URL = "https://lacier-costless-elisabeth.ngrok-free.dev"; // e.g. "https://a1b2c3d4.ngrok-free.app"
+const OLLAMA_BASE_URL = "https://lacier-costless-elisabeth.ngrok-free.dev";
 
 // ---------------------------
 // UI ELEMENTS
@@ -37,9 +37,12 @@ function setInputEnabled(enabled) {
 }
 
 // ---------------------------
-// SESSION / STATE MACHINE
+// STATE MACHINE
 // ---------------------------
 const Stage = {
+  Conversation: "Conversation",
+  AwaitingYesNo: "AwaitingYesNo",
+  AwaitingField: "AwaitingField",
   AwaitingIntent: "AwaitingIntent",
   AwaitingParams: "AwaitingParams",
   ReadyToGenerateSql: "ReadyToGenerateSql"
@@ -53,7 +56,9 @@ const KNOWN_PATTERNS = {
 };
 
 const session = {
-  stage: Stage.AwaitingIntent,
+  stage: Stage.Conversation,
+  pendingField: null,
+  pendingAction: null,
   pattern: null,
   collected: {},
   missing: []
@@ -61,8 +66,9 @@ const session = {
 
 function debugState(extra = {}) {
   updateDebug({
-    status: "OK",
     stage: session.stage,
+    pendingField: session.pendingField,
+    pendingAction: session.pendingAction,
     pattern: session.pattern,
     collectedParams: session.collected,
     missingParams: session.missing,
@@ -72,7 +78,7 @@ function debugState(extra = {}) {
 }
 
 // ---------------------------
-// OLLAMA STREAMING CALL (NDJSON format)
+// OLLAMA STREAMING (NDJSON)
 // ---------------------------
 async function callLLMStreaming(prompt) {
   const model = modelSelect.value;
@@ -106,21 +112,12 @@ async function callLLMStreaming(prompt) {
     if (done) break;
 
     const chunk = decoder.decode(value, { stream: true });
-
-    // Ollama streams NDJSON lines, no "data:" prefix
     const lines = chunk.split("\n").filter(l => l.trim() !== "");
 
     for (const line of lines) {
-      const jsonStr = line.trim();
-      if (!jsonStr) continue;
-
       try {
-        const data = JSON.parse(jsonStr);
-
-        // Ollama format: { message: { role, content }, done?: boolean }
-        if (data.done) {
-          continue;
-        }
+        const data = JSON.parse(line.trim());
+        if (data.done) continue;
 
         const delta = data.message?.content || "";
         if (delta) {
@@ -128,12 +125,41 @@ async function callLLMStreaming(prompt) {
           agentMsg.textContent = fullText;
         }
       } catch {
-        // ignore parse errors on partial chunks
+        // ignore partial chunks
       }
     }
   }
 
   return fullText.trim();
+}
+
+// ---------------------------
+// HYBRID FIELD DETECTION (F3)
+// ---------------------------
+async function detectField(text) {
+  const t = text.toLowerCase();
+
+  // Keyword detection first
+  if (t.includes("email")) return "Email";
+  if (t.includes("policy number")) return "PolicyNumber";
+  if (t.includes("phone")) return "Phone";
+  if (t.includes("address")) return "Address";
+
+  // LLM fallback (P2 strict canonical)
+  const prompt = `
+Identify which field of the policy the user is referring to.
+
+User: "${text}"
+
+Respond with exactly one of:
+Email, Phone, Address, PolicyNumber, Unknown.
+`.trim();
+
+  const out = await callLLMStreaming(prompt);
+  const field = out.split(/\s+/)[0];
+
+  const canonical = ["Email", "Phone", "Address", "PolicyNumber", "Unknown"];
+  return canonical.includes(field) ? field : "Unknown";
 }
 
 // ---------------------------
@@ -151,8 +177,7 @@ Respond ONLY with the pattern name or "Unknown".
 `.trim();
 
   const out = await callLLMStreaming(prompt);
-  const token = out.split(/\s+/)[0] || "";
-  return token.replace(/[^A-Za-z0-9_]/g, "");
+  return out.split(/\s+/)[0] || "Unknown";
 }
 
 // ---------------------------
@@ -182,7 +207,7 @@ Return JSON only.
 }
 
 // ---------------------------
-// SQL TEMPLATE FILLING
+// SQL GENERATION
 // ---------------------------
 async function fillTemplate(template, params) {
   const prompt = `
@@ -199,9 +224,6 @@ Return ONLY the SQL.
   return await callLLMStreaming(prompt);
 }
 
-// ---------------------------
-// SQL VALIDATION
-// ---------------------------
 function validateSql(sql) {
   const s = sql.toUpperCase();
 
@@ -215,10 +237,31 @@ function validateSql(sql) {
   if (!s.includes("EMAIL") || !s.includes("POLICYNUMBER"))
     return "Only Email and PolicyNumber columns allowed.";
 
-  if (s.includes(" LIKE ") || s.includes(" IN ") || s.includes(" BETWEEN "))
-    return "Pattern does not allow multi-row updates.";
-
   return null;
+}
+
+// ---------------------------
+// CONVERSATION LAYER
+// ---------------------------
+function detectConversationMode(text) {
+  const t = text.toLowerCase();
+
+  const SMALL_TALK = ["hi", "hello", "hey", "yo", "how are you"];
+  if (SMALL_TALK.some(p => t.includes(p))) return "smallTalk";
+
+  const DOMAIN = ["policy", "email", "account"];
+  const PROBLEM = ["wrong", "incorrect", "issue", "problem", "mismatch"];
+  const ACTION = ["update", "change", "fix", "correct", "modify"];
+
+  const hasDomain = DOMAIN.some(k => t.includes(k));
+  const hasProblem = PROBLEM.some(k => t.includes(k));
+  const hasAction = ACTION.some(k => t.includes(k));
+
+  if (hasAction) return "action";
+  if (hasDomain && hasProblem) return "domainProblem";
+  if (hasDomain) return "genericProblem";
+
+  return "unknown";
 }
 
 // ---------------------------
@@ -227,21 +270,13 @@ function validateSql(sql) {
 async function handleIntent(text) {
   const pattern = await classifyIntent(text);
 
-  if (!pattern || pattern === "Unknown") {
+  if (pattern === "Unknown") {
     addMessage("I only support updating email for a policy in this POC.", "agent");
-    debugState({ note: "Unknown or empty pattern", rawPattern: pattern });
     return;
   }
 
   session.pattern = pattern;
   const def = KNOWN_PATTERNS[pattern];
-
-  if (!def) {
-    addMessage(`Pattern "${pattern}" is not configured in this POC.`, "agent");
-    debugState({ note: "Pattern not found in KNOWN_PATTERNS", rawPattern: pattern });
-    session.pattern = null;
-    return;
-  }
 
   const extracted = await extractParams(pattern, text);
   session.collected = extracted;
@@ -254,26 +289,13 @@ async function handleIntent(text) {
     session.stage = Stage.ReadyToGenerateSql;
     await handleSql();
   }
-
-  debugState();
 }
 
 async function handleParams(text) {
   const def = KNOWN_PATTERNS[session.pattern];
-
-  if (!def) {
-    addMessage("Internal state error: pattern definition missing. Resetting session.", "agent");
-    session.stage = Stage.AwaitingIntent;
-    session.pattern = null;
-    session.collected = {};
-    session.missing = [];
-    debugState({ error: "Missing pattern definition in handleParams" });
-    return;
-  }
-
   const extracted = await extractParams(session.pattern, text);
-  session.collected = { ...session.collected, ...extracted };
 
+  session.collected = { ...session.collected, ...extracted };
   session.missing = def.requiredParams.filter(p => !session.collected[p]);
 
   if (session.missing.length > 0) {
@@ -282,38 +304,23 @@ async function handleParams(text) {
     session.stage = Stage.ReadyToGenerateSql;
     await handleSql();
   }
-
-  debugState();
 }
 
 async function handleSql() {
   const def = KNOWN_PATTERNS[session.pattern];
-
-  if (!def) {
-    addMessage("Internal state error: pattern definition missing during SQL generation. Resetting session.", "agent");
-    session.stage = Stage.AwaitingIntent;
-    session.pattern = null;
-    session.collected = {};
-    session.missing = [];
-    debugState({ error: "Missing pattern definition in handleSql" });
-    return;
-  }
-
   const sql = await fillTemplate(def.sqlTemplate, session.collected);
 
   const error = validateSql(sql);
   if (error) {
     addMessage("SQL failed validation:\n" + error + "\n\nGenerated:\n" + sql, "agent");
   } else {
-    addMessage("Here is your SQL:\n\n" + sql + "\n\n(POC only – do not run directly in prod.)", "agent");
+    addMessage("Here is your SQL:\n\n" + sql, "agent");
   }
 
-  session.stage = Stage.AwaitingIntent;
+  session.stage = Stage.Conversation;
   session.pattern = null;
   session.collected = {};
   session.missing = [];
-
-  debugState({ note: "Session reset after SQL" });
 }
 
 // ---------------------------
@@ -327,51 +334,69 @@ async function handleUserMessage() {
   addMessage(text, "user");
 
   setInputEnabled(false);
+
   try {
-    if (session.stage === Stage.AwaitingIntent) {
-      await handleIntent(text);
-    } else if (session.stage === Stage.AwaitingParams) {
-      await handleParams(text);
+    const mode = detectConversationMode(text);
+
+    // Small talk
+    if (mode === "smallTalk") {
+      addMessage("Hi! What can I help you with today?", "agent");
+      return;
     }
+
+    // Domain problem → ask yes/no confirmation
+    if (mode === "domainProblem") {
+      session.stage = Stage.AwaitingYesNo;
+      session.pendingField = await detectField(text);
+      addMessage(`It sounds like the ${session.pendingField.toLowerCase()} on the policy is incorrect. Do you want to update it?`, "agent");
+      return;
+    }
+
+    // Awaiting yes/no
+    if (session.stage === Stage.AwaitingYesNo) {
+      const t = text.toLowerCase();
+      if (t === "yes" || t === "y") {
+        session.pattern = "UpdateEmailForPolicy";
+        session.stage = Stage.AwaitingParams;
+        addMessage("Sure — what's the policy number?", "agent");
+        return;
+      }
+      if (t === "no" || t === "n") {
+        session.stage = Stage.Conversation;
+        addMessage("No problem — what is wrong with the policy?", "agent");
+        return;
+      }
+      addMessage("Please answer yes or no.", "agent");
+      return;
+    }
+
+    // Generic problem
+    if (mode === "genericProblem") {
+      addMessage("What is wrong with the policy?", "agent");
+      return;
+    }
+
+    // Actionable request → run intent
+    if (mode === "action") {
+      await handleIntent(text);
+      return;
+    }
+
+    // If already collecting params
+    if (session.stage === Stage.AwaitingParams) {
+      await handleParams(text);
+      return;
+    }
+
+    addMessage("Can you tell me more about the issue with the policy?", "agent");
+
   } catch (err) {
     addMessage("Error: " + err.message, "agent");
-    debugState({ error: err.message, stack: err.stack });
+    debugState({ error: err.message });
   } finally {
     setInputEnabled(true);
   }
 }
-
-// ---------------------------
-// CONNECTION TEST (safe version)
-// ---------------------------
-async function testConnection() {
-  try {
-    // Ollama accepts POST to /api/tags; this plays nicer with some ngrok setups
-    const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}"
-    });
-    const data = await res.json();
-    updateDebug({
-      status: "Connected to local LLM",
-      models: data.models?.map(m => m.name)
-    });
-  } catch (err) {
-    updateDebug({
-      status: "Cannot reach local LLM",
-      error: err.message,
-      hint: "Check ngrok is running and URL is correct."
-    });
-  }
-}
-
-// Uncomment if you want the connection test to run on load
-// testConnection();
-
-// ---------------------------
-// EVENTS
-// ---------------------------
 sendBtn.addEventListener("click", handleUserMessage);
 inputEl.addEventListener("keypress", e => {
   if (e.key === "Enter") handleUserMessage();
